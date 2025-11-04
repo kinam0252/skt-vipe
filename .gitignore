@@ -171,3 +171,5 @@ csrc/include/
 
 *.mp4
 2125_2_cut1/
+vipe/check/
+overlap_pixels_visualization/

@@ -299,6 +299,11 @@ class ClientClosures:
                 "Nearby Distance", min=0.01, max=10.0, step=0.01, initial_value=1.0,
                 hint="Object 근처에서 고려할 점들의 거리 (m)"
             )
+            
+            self.gui_flow_threshold = self.client.gui.add_slider(
+                "Flow Threshold", min=1.0, max=100.0, step=1.0, initial_value=50.0,
+                hint="Optical flow 추적 시 급격한 변화를 제외하는 임계값 (픽셀)"
+            )
 
             # 업데이트 핸들러
             async def _update_object(_):
@@ -321,6 +326,445 @@ class ClientClosures:
                 logger.info(f"✅ REPROJECTION")
                 save_path = f"reproject_{int(time.time())}.mp4"
                 self.reproject_pointcloud_to_video(save_path)
+
+            # --- 🔍 Overlap Pixels 확인 버튼 추가 ---
+            gui_check_overlap = self.client.gui.add_button(
+                "Check Overlap Pixels",
+                hint="첫 프레임에서 object가 overlap하는 픽셀 좌표를 확인하고, 모든 프레임으로 추적하여 이미지에 표시하고 저장합니다",
+            )
+
+            @gui_check_overlap.on_click
+            def _(_):
+                # 첫 프레임 overlap 픽셀 확인
+                overlap_pixels = self._get_object_overlap_pixels(frame_idx=0)
+                if overlap_pixels is not None:
+                    logger.info(f"✅ Found {len(overlap_pixels)} overlap pixels")
+                    logger.info(f"   Pixel range: u=[{overlap_pixels[:, 0].min()}, {overlap_pixels[:, 0].max()}], "
+                              f"v=[{overlap_pixels[:, 1].min()}, {overlap_pixels[:, 1].max()}]")
+                    
+                    # 모든 프레임으로 overlap 픽셀 추적
+                    logger.info("🔍 Tracking overlap pixels across all frames...")
+                    tracked_overlap = self._track_overlap_pixels_all_frames(frame_idx_start=0)
+                    logger.info(f"✅ Tracked overlap pixels across {len(tracked_overlap)} frames")
+                    
+                    # 근처 픽셀 찾기 및 추적
+                    tracked_nearby = None
+                    nearby_pixels = self._get_nearby_pixels(overlap_pixels, frame_idx=0, distance_threshold=20.0)
+                    if nearby_pixels is not None:
+                        logger.info("🔍 Tracking nearby pixels across all frames...")
+                        tracked_nearby = self._track_nearby_pixels_all_frames(nearby_pixels)
+                    else:
+                        logger.warning("❌ Failed to track nearby pixels across frames")
+                    
+                    if tracked_overlap is not None:
+                        logger.info(f"✅ Tracked overlap pixels across {len(tracked_overlap)} frames")
+                        if tracked_nearby is not None:
+                            logger.info(f"✅ Tracked nearby pixels across {len(tracked_nearby)} frames")
+                        # 이미지에 표시하고 저장
+                        self._visualize_and_save_tracked_pixels(tracked_overlap, tracked_nearby)
+                    else:
+                        logger.warning("❌ Failed to track pixels across frames")
+                else:
+                    logger.warning("❌ Failed to get overlap pixels. Check if object is placed correctly.")
+
+    def _get_object_overlap_pixels(self, frame_idx: int = 0):
+        """
+        첫 프레임에서 object가 overlap되는 픽셀 좌표를 반환합니다.
+        
+        Args:
+            frame_idx: 프레임 인덱스 (기본값: 0, 첫 프레임)
+            
+        Returns:
+            overlap_pixels: numpy array of shape [N, 2] with (u, v) pixel coordinates
+            또는 None if object가 없거나 프로젝션 실패
+        """
+        if not hasattr(self, "pc_world"):
+            return None
+        
+        current_artifact = self.global_context().artifacts[self.gui_id.value]
+        pose_seq = read_pose_artifacts(current_artifact.pose_path)[1]
+        intr_seq = read_intrinsics_artifacts(current_artifact.intrinsics_path, current_artifact.camera_type_path)[1]
+        rgb_seq = list(read_rgb_artifacts(current_artifact.rgb_path))
+        
+        # 프레임 인덱스 유효성 검사
+        if frame_idx >= len(rgb_seq):
+            return None
+        
+        # pose_seq와 intr_seq는 인덱싱 가능하지만 len()이 없을 수 있음
+        try:
+            if frame_idx >= len(intr_seq):
+                return None
+        except TypeError:
+            # intr_seq가 len()을 지원하지 않는 경우, rgb_seq 길이와 비교
+            pass
+        
+        # 첫 프레임의 pose와 intrinsics
+        try:
+            pose = pose_seq[frame_idx].matrix().cpu().numpy()
+            intr = intr_seq[frame_idx].cpu().numpy()
+        except (IndexError, AttributeError):
+            return None
+        h, w = rgb_seq[frame_idx][1].shape[:2]
+        
+        # Object 점들을 카메라 좌표로 변환
+        R = pose[:3, :3]
+        t = pose[:3, 3]
+        obj_points = self.pc_world.copy()
+        
+        cam_points = (obj_points - t) @ R.T
+        
+        # Depth가 양수인 점들만 유효
+        valid_depth = cam_points[:, 2] > 1e-6
+        if not valid_depth.any():
+            return None
+        
+        cam_points_valid = cam_points[valid_depth]
+        
+        # 픽셀 좌표로 프로젝션
+        fx, fy, cx, cy = intr[:4]
+        u = fx * (cam_points_valid[:, 0] / cam_points_valid[:, 2]) + cx
+        v = fy * (cam_points_valid[:, 1] / cam_points_valid[:, 2]) + cy
+        
+        # 이미지 범위 내에 있는 픽셀만 선택
+        in_bounds = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        if not in_bounds.any():
+            return None
+        
+        overlap_pixels = np.stack([u[in_bounds], v[in_bounds]], axis=1).astype(int)
+        
+        logger.info(f"✅ Found {len(overlap_pixels)} overlapping pixels for object in frame {frame_idx}")
+        
+        return overlap_pixels
+
+    def _track_overlap_pixels_all_frames(self, frame_idx_start: int = 0):
+        """
+        첫 프레임의 overlap 픽셀들을 optical flow로 추적하여 모든 프레임에서의 위치를 구합니다.
+        
+        Args:
+            frame_idx_start: 시작 프레임 인덱스 (기본값: 0)
+            
+        Returns:
+            tracked_pixels: dict {frame_idx: numpy array [N, 2]} 형태로 각 프레임의 픽셀 좌표
+            또는 None if 실패
+        """
+        # 첫 프레임의 overlap 픽셀 가져오기
+        overlap_pixels_frame0 = self._get_object_overlap_pixels(frame_idx=frame_idx_start)
+        if overlap_pixels_frame0 is None or len(overlap_pixels_frame0) == 0:
+            return None
+        
+        if not hasattr(self, "flow_cache") or len(self.flow_cache) == 0:
+            return None
+        
+        current_artifact = self.global_context().artifacts[self.gui_id.value]
+        rgb_seq = list(read_rgb_artifacts(current_artifact.rgb_path))
+        total_frames = len(rgb_seq)
+        
+        if total_frames == 0:
+            return None
+        
+        h, w = rgb_seq[0][1].shape[:2]
+        
+        # 추적 결과 저장
+        tracked_pixels = {frame_idx_start: overlap_pixels_frame0.astype(float)}
+        
+        # 현재 픽셀 좌표 (float로 추적)
+        current_pixels = overlap_pixels_frame0.astype(float).copy()
+        valid_mask = np.ones(len(current_pixels), dtype=bool)
+        
+        # 각 프레임별로 추적
+        for frame_idx in range(frame_idx_start + 1, total_frames):
+            if frame_idx - 1 >= len(self.flow_cache) or self.flow_cache[frame_idx - 1] is None:
+                # flow가 없으면 이전 프레임의 위치 유지
+                tracked_pixels[frame_idx] = current_pixels[valid_mask].copy()
+                continue
+            
+            # Optical flow 적용
+            flow = self.flow_cache[frame_idx - 1].numpy()
+            
+            # 유효한 픽셀 좌표만 처리
+            if not valid_mask.any():
+                tracked_pixels[frame_idx] = np.empty((0, 2))
+                continue
+            
+            # 현재 픽셀 좌표가 이미지 범위 내에 있는지 확인
+            in_bounds = (
+                (current_pixels[:, 0] >= 0) & (current_pixels[:, 0] < w) &
+                (current_pixels[:, 1] >= 0) & (current_pixels[:, 1] < h)
+            )
+            valid_mask &= in_bounds
+            
+            if not valid_mask.any():
+                tracked_pixels[frame_idx] = np.empty((0, 2))
+                continue
+            
+            # Optical flow 샘플링
+            u_int = np.clip(current_pixels[valid_mask, 0].astype(int), 0, w - 1)
+            v_int = np.clip(current_pixels[valid_mask, 1].astype(int), 0, h - 1)
+            
+            # Flow 값 가져오기
+            u_flow = flow[0, v_int, u_int]
+            v_flow = flow[1, v_int, u_int]
+            
+            # Flow 크기 계산 (급격한 변화 필터링)
+            flow_magnitude = np.sqrt(u_flow**2 + v_flow**2)
+            flow_threshold = getattr(self, "gui_flow_threshold", None)
+            if flow_threshold is not None:
+                flow_threshold_value = flow_threshold.value
+            else:
+                flow_threshold_value = 50.0  # 기본값
+            
+            # Threshold 이상인 flow는 제외
+            valid_flow_mask = flow_magnitude <= flow_threshold_value
+            valid_mask_indices = np.where(valid_mask)[0]
+            valid_mask[valid_mask_indices[~valid_flow_mask]] = False
+            
+            if not valid_mask.any():
+                tracked_pixels[frame_idx] = np.empty((0, 2))
+                continue
+            
+            # 유효한 flow만 적용
+            valid_flow_indices = np.where(valid_flow_mask)[0]
+            valid_mask_flow = valid_mask.copy()
+            valid_mask_flow[valid_mask_indices[~valid_flow_mask]] = False
+            
+            # 픽셀 좌표 업데이트
+            current_pixels[valid_mask_flow, 0] += u_flow[valid_flow_mask]
+            current_pixels[valid_mask_flow, 1] += v_flow[valid_flow_mask]
+            
+            # 결과 저장
+            tracked_pixels[frame_idx] = current_pixels[valid_mask].copy()
+        
+        logger.info(f"✅ Tracked overlap pixels across {len(tracked_pixels)} frames")
+        
+        return tracked_pixels
+
+    def _get_nearby_pixels(self, overlap_pixels: np.ndarray, frame_idx: int = 0, distance_threshold: float = 20.0):
+        """
+        Overlap 픽셀의 bounding box 내부에 있으면서 object 바깥의 scene 포인트들을 찾습니다.
+        
+        Args:
+            overlap_pixels: overlap 픽셀 좌표 [N, 2]
+            frame_idx: 프레임 인덱스
+            distance_threshold: 사용하지 않음 (호환성을 위해 유지)
+            
+        Returns:
+            nearby_pixels: bounding box 내부의 object 바깥 픽셀 좌표 [M, 2] 또는 None
+        """
+        current_artifact = self.global_context().artifacts[self.gui_id.value]
+        depth_seq = list(read_depth_artifacts(current_artifact.depth_path))
+        
+        if frame_idx >= len(depth_seq):
+            logger.warning("❌ No depth sequence found")
+            return None
+        
+        depth = depth_seq[frame_idx][1].cpu().numpy()
+        h, w = depth.shape
+        
+        # Overlap 픽셀의 bounding box 계산
+        u_min = int(overlap_pixels[:, 0].min())
+        u_max = int(overlap_pixels[:, 0].max()) + 1
+        v_min = int(overlap_pixels[:, 1].min())
+        v_max = int(overlap_pixels[:, 1].max()) + 1
+        
+        logger.info(f"   Bounding box: u=[{u_min}, {u_max}], v=[{v_min}, {v_max}]")
+        
+        # 유효한 depth 마스크
+        mask = reliable_depth_mask_range(torch.from_numpy(depth)).numpy()
+        ys, xs = np.where(mask)
+        
+        if len(xs) == 0:
+            logger.warning("❌ No valid depth pixels found")
+            return None
+        
+        # 모든 유효한 픽셀 좌표
+        all_pixels = np.stack([xs, ys], axis=1).astype(float)
+        
+        # Bounding box 내부에 있는 픽셀만 선택
+        in_bbox_mask = (
+            (all_pixels[:, 0] >= u_min) & (all_pixels[:, 0] < u_max) &
+            (all_pixels[:, 1] >= v_min) & (all_pixels[:, 1] < v_max)
+        )
+        
+        if in_bbox_mask.sum() == 0:
+            logger.warning("❌ No pixels inside bounding box")
+            return None
+        
+        bbox_pixels = all_pixels[in_bbox_mask]
+        
+        # Overlap 픽셀 자체는 제외 (object 바깥만)
+        overlap_set = set(map(tuple, overlap_pixels.astype(int)))
+        bbox_pixels_int = bbox_pixels.astype(int)
+        not_overlap_mask = np.array([tuple(p) not in overlap_set for p in bbox_pixels_int])
+        
+        if not_overlap_mask.sum() == 0:
+            logger.warning("❌ No pixels found outside object in bounding box")
+            return None
+        
+        nearby_pixels = bbox_pixels[not_overlap_mask]
+        
+        logger.info(f"✅ Found {len(nearby_pixels)} pixels inside bounding box but outside object")
+        
+        return nearby_pixels
+
+    def _track_nearby_pixels_all_frames(self, nearby_pixels_frame0: np.ndarray):
+        """
+        첫 프레임의 근처 픽셀들을 optical flow로 추적합니다.
+        
+        Args:
+            nearby_pixels_frame0: 첫 프레임의 근처 픽셀 좌표 [N, 2]
+            
+        Returns:
+            tracked_pixels: dict {frame_idx: numpy array [N, 2]}
+        """
+        if not hasattr(self, "flow_cache") or len(self.flow_cache) == 0:
+            logger.warning("❌ No flow cache found")
+            return None
+        
+        current_artifact = self.global_context().artifacts[self.gui_id.value]
+        rgb_seq = list(read_rgb_artifacts(current_artifact.rgb_path))
+        total_frames = len(rgb_seq)
+        
+        if total_frames == 0:
+            logger.warning("❌ No total frames found")
+            return None
+        
+        h, w = rgb_seq[0][1].shape[:2]
+        
+        tracked_pixels = {0: nearby_pixels_frame0.astype(float)}
+        current_pixels = nearby_pixels_frame0.astype(float).copy()
+        valid_mask = np.ones(len(current_pixels), dtype=bool)
+        
+        for frame_idx in range(1, total_frames):
+            if frame_idx - 1 >= len(self.flow_cache) or self.flow_cache[frame_idx - 1] is None:
+                tracked_pixels[frame_idx] = current_pixels[valid_mask].copy()
+                continue
+            
+            flow = self.flow_cache[frame_idx - 1].numpy()
+            
+            if not valid_mask.any():
+                tracked_pixels[frame_idx] = np.empty((0, 2))
+                continue
+            
+            in_bounds = (
+                (current_pixels[:, 0] >= 0) & (current_pixels[:, 0] < w) &
+                (current_pixels[:, 1] >= 0) & (current_pixels[:, 1] < h)
+            )
+            valid_mask &= in_bounds
+            
+            if not valid_mask.any():
+                tracked_pixels[frame_idx] = np.empty((0, 2))
+                continue
+            
+            u_int = np.clip(current_pixels[valid_mask, 0].astype(int), 0, w - 1)
+            v_int = np.clip(current_pixels[valid_mask, 1].astype(int), 0, h - 1)
+            
+            u_flow = flow[0, v_int, u_int]
+            v_flow = flow[1, v_int, u_int]
+            
+            # Flow 크기 계산 (급격한 변화 필터링)
+            flow_magnitude = np.sqrt(u_flow**2 + v_flow**2)
+            flow_threshold = getattr(self, "gui_flow_threshold", None)
+            if flow_threshold is not None:
+                flow_threshold_value = flow_threshold.value
+            else:
+                flow_threshold_value = 50.0  # 기본값
+            
+            # Threshold 이상인 flow는 제외
+            valid_flow_mask = flow_magnitude <= flow_threshold_value
+            valid_mask_indices = np.where(valid_mask)[0]
+            valid_mask[valid_mask_indices[~valid_flow_mask]] = False
+            
+            if not valid_mask.any():
+                tracked_pixels[frame_idx] = np.empty((0, 2))
+                continue
+            
+            # 유효한 flow만 적용
+            valid_flow_indices = np.where(valid_flow_mask)[0]
+            valid_mask_flow = valid_mask.copy()
+            valid_mask_flow[valid_mask_indices[~valid_flow_mask]] = False
+            
+            current_pixels[valid_mask_flow, 0] += u_flow[valid_flow_mask]
+            current_pixels[valid_mask_flow, 1] += v_flow[valid_flow_mask]
+            
+            tracked_pixels[frame_idx] = current_pixels[valid_mask].copy()
+        
+        return tracked_pixels
+
+    def _visualize_and_save_tracked_pixels(self, tracked_overlap: dict, tracked_nearby: dict = None):
+        """
+        추적된 픽셀들을 각 프레임 이미지에 표시하고 저장합니다.
+        - Overlap 픽셀: 빨간색
+        - 근처 픽셀: 파란색
+        
+        Args:
+            tracked_overlap: {frame_idx: numpy array [N, 2]} - overlap 픽셀
+            tracked_nearby: {frame_idx: numpy array [M, 2]} - 근처 픽셀 (optional)
+        """
+        from pathlib import Path
+        from PIL import ImageDraw
+        
+        current_artifact = self.global_context().artifacts[self.gui_id.value]
+        rgb_seq = list(read_rgb_artifacts(current_artifact.rgb_path))
+        
+        save_dir = Path("overlap_pixels_visualization")
+        save_dir.mkdir(exist_ok=True)
+        
+        logger.info(f"🎨 Visualizing and saving tracked pixels to {save_dir}/")
+        
+        all_frame_indices = set(tracked_overlap.keys())
+        if tracked_nearby:
+            all_frame_indices.update(tracked_nearby.keys())
+        
+        for frame_idx in sorted(all_frame_indices):
+            if frame_idx >= len(rgb_seq):
+                continue
+            
+            # RGB 이미지 가져오기
+            rgb_tensor = rgb_seq[frame_idx][1]
+            if isinstance(rgb_tensor, torch.Tensor):
+                rgb_img = rgb_tensor.cpu().numpy()
+            else:
+                rgb_img = rgb_tensor
+            
+            if rgb_img.max() <= 1.0:
+                rgb_img = (rgb_img * 255).astype(np.uint8)
+            else:
+                rgb_img = rgb_img.astype(np.uint8)
+            
+            img = Image.fromarray(rgb_img)
+            draw = ImageDraw.Draw(img)
+            h, w = rgb_img.shape[:2]
+            
+            # 근처 픽셀 (파란색) 먼저 그리기
+            if tracked_nearby and frame_idx in tracked_nearby:
+                nearby_pixels = tracked_nearby[frame_idx]
+                if len(nearby_pixels) > 0:
+                    valid_nearby = nearby_pixels[
+                        (nearby_pixels[:, 0] >= 0) & (nearby_pixels[:, 0] < w) &
+                        (nearby_pixels[:, 1] >= 0) & (nearby_pixels[:, 1] < h)
+                    ]
+                    for u, v in valid_nearby.astype(int):
+                        draw.ellipse([u-1, v-1, u+1, v+1], fill=(0, 0, 255))  # 파란색
+            
+            # Overlap 픽셀 (빨간색) 그리기
+            if frame_idx in tracked_overlap:
+                overlap_pixels = tracked_overlap[frame_idx]
+                if len(overlap_pixels) > 0:
+                    valid_overlap = overlap_pixels[
+                        (overlap_pixels[:, 0] >= 0) & (overlap_pixels[:, 0] < w) &
+                        (overlap_pixels[:, 1] >= 0) & (overlap_pixels[:, 1] < h)
+                    ]
+                    for u, v in valid_overlap.astype(int):
+                        draw.ellipse([u-1, v-1, u+1, v+1], fill=(255, 0, 0))  # 빨간색
+            
+            # 이미지 저장
+            save_path = save_dir / f"frame_{frame_idx:04d}_overlap.png"
+            img.save(save_path)
+            
+            if frame_idx % 10 == 0:
+                logger.info(f"  Saved frame {frame_idx}/{len(all_frame_indices)-1}")
+        
+        logger.info(f"✅ Saved {len(all_frame_indices)} visualization images to {save_dir}/")
 
     def _update_custom_object(self):
         """GUI 슬라이더 값으로 물체 transform"""

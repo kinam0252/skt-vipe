@@ -336,23 +336,6 @@ class ClientClosures:
                 logger.info(f"✅ REPROJECTION")
                 save_path = f"reproject_{int(time.time())}.mp4"
                 self.reproject_pointcloud_to_video(save_path)
-            
-            # --- 🖼️ Reproject Single Frame 버튼 추가 ---
-            max_frames = len(self.scene_frame_handles) - 1 if len(self.scene_frame_handles) > 0 else 0
-            gui_frame_select = self.client.gui.add_slider(
-                "Frame to Reproject", min=0, max=max_frames, step=1, initial_value=0
-            )
-            
-            gui_reproject_single = self.client.gui.add_button(
-                "Reproject Single Frame",
-                hint="선택한 프레임만 reproject하여 이미지로 저장합니다",
-            )
-            
-            @gui_reproject_single.on_click
-            def _(_):
-                frame_idx = int(gui_frame_select.value)
-                logger.info(f"✅ Reprojecting single frame {frame_idx}")
-                self.reproject_single_frame(frame_idx)
 
             # --- 🔍 Overlap Pixels 확인 버튼 추가 ---
             gui_check_overlap = self.client.gui.add_button(
@@ -389,10 +372,30 @@ class ClientClosures:
                             logger.info(f"✅ Tracked nearby pixels across {len(tracked_nearby)} frames")
                         # 이미지에 표시하고 저장
                         self._visualize_and_save_tracked_pixels(tracked_overlap, tracked_nearby)
+                        
+                        # 추적된 픽셀 저장 (reproject용)
+                        self.tracked_overlap_pixels = tracked_overlap
+                        self.tracked_nearby_pixels = tracked_nearby
+                        logger.info("✅ Tracked pixels saved for reprojection")
                     else:
                         logger.warning("❌ Failed to track pixels across frames")
                 else:
                     logger.warning("❌ Failed to get overlap pixels. Check if object is placed correctly.")
+            
+            # --- 🎬 Reproject Aligned Video 버튼 추가 ---
+            gui_reproject_aligned = self.client.gui.add_button(
+                "Reproject Aligned Video",
+                hint="추적된 픽셀들의 3D 모션 벡터를 계산하여 object를 이동시키고 reproject합니다",
+            )
+            
+            @gui_reproject_aligned.on_click
+            def _(_):
+                if not hasattr(self, "tracked_overlap_pixels") or not hasattr(self, "tracked_nearby_pixels"):
+                    logger.warning("❌ Please run 'Check Overlap Pixels' first to track pixels")
+                    return
+                logger.info("🎬 Starting aligned video reprojection...")
+                save_path = f"reproject_aligned_{int(time.time())}.mp4"
+                self._reproject_aligned_video(save_path)
 
     def _get_object_overlap_pixels(self, frame_idx: int = 0):
         """
@@ -836,6 +839,165 @@ class ClientClosures:
         
         logger.info(f"✅ Saved {len(all_frame_indices)} visualization images to {save_dir}/")
 
+    def _reproject_aligned_video(self, save_path="reproject_aligned.mp4"):
+        """
+        추적된 overlap 및 nearby 픽셀들을 3D로 올려서 각 프레임별 모션 벡터를 계산하고,
+        평균 모션 벡터만큼 object를 이동시킨 후 전체 scene과 함께 reproject합니다.
+        """
+        import subprocess, tempfile
+        from PIL import Image
+        from vipe.ext.lietorch import SE3
+        from vipe.utils.visualization import project_points
+        
+        logger.info("🎬 Starting aligned video reprojection...")
+        
+        current_artifact = self.global_context().artifacts[self.gui_id.value]
+        rgb_seq = list(read_rgb_artifacts(current_artifact.rgb_path))
+        pose_seq = read_pose_artifacts(current_artifact.pose_path)[1]
+        _, intr_seq, camera_types = read_intrinsics_artifacts(current_artifact.intrinsics_path, current_artifact.camera_type_path)
+        depth_seq = list(read_depth_artifacts(current_artifact.depth_path))
+        h, w, _ = rgb_seq[0][1].shape
+        
+        if not hasattr(self, "pc_world"):
+            logger.warning("❌ No object point cloud found.")
+            return
+        
+        tracked_overlap = self.tracked_overlap_pixels
+        tracked_nearby = self.tracked_nearby_pixels
+        
+        # 첫 프레임의 모든 픽셀들을 3D로 unproject
+        frame_0_depth = depth_seq[0][1].cpu().numpy()
+        frame_0_intr = intr_seq[0].cpu().numpy()
+        frame_0_pose = pose_seq[0].matrix().cpu().numpy()
+        
+        fx_0, fy_0, cx_0, cy_0 = frame_0_intr[:4]
+        R_0, t_0 = frame_0_pose[:3, :3], frame_0_pose[:3, 3]
+        
+        # 첫 프레임의 overlap + nearby 픽셀들을 3D로 변환
+        def pixels_to_3d(pixels, depth_map, intr, pose):
+            """픽셀 좌표들을 3D world 좌표로 변환"""
+            u_int = np.clip(pixels[:, 0].astype(int), 0, w - 1)
+            v_int = np.clip(pixels[:, 1].astype(int), 0, h - 1)
+            z = depth_map[v_int, u_int]
+            fx, fy, cx, cy = intr[:4]
+            R, t = pose[:3, :3], pose[:3, 3]
+            X = (u_int - cx) * z / fx
+            Y = (v_int - cy) * z / fy
+            pts_cam = np.stack([X, Y, z], axis=-1)
+            pts_world = (pts_cam @ R.T) + t
+            return pts_world
+        
+        # 첫 프레임의 3D 포인트들
+        overlap_pixels_0 = tracked_overlap.get(0)
+        nearby_pixels_0 = tracked_nearby.get(0) if tracked_nearby else None
+        
+        pts_3d_frame_0 = []
+        if overlap_pixels_0 is not None and len(overlap_pixels_0) > 0:
+            pts_3d_overlap = pixels_to_3d(overlap_pixels_0, frame_0_depth, frame_0_intr, frame_0_pose)
+            pts_3d_frame_0.append(pts_3d_overlap)
+        if nearby_pixels_0 is not None and len(nearby_pixels_0) > 0:
+            pts_3d_nearby = pixels_to_3d(nearby_pixels_0, frame_0_depth, frame_0_intr, frame_0_pose)
+            pts_3d_frame_0.append(pts_3d_nearby)
+        
+        if len(pts_3d_frame_0) == 0:
+            logger.warning("❌ No valid 3D points in frame 0")
+            return
+        
+        pts_3d_frame_0 = np.vstack(pts_3d_frame_0)
+        logger.info(f"✅ Initialized {len(pts_3d_frame_0)} reference 3D points from frame 0")
+        
+        # Object 초기 위치
+        obj_points = self.pc_world.copy()
+        obj_colors = np.tile(np.array([[0, 255, 0]]), (obj_points.shape[0], 1))
+        
+        frames = []
+        
+        for frame_idx in range(min(len(depth_seq), len(rgb_seq))):
+            rgb = rgb_seq[frame_idx][1].cpu().numpy()
+            depth = depth_seq[frame_idx][1].cpu().numpy()
+            intr = intr_seq[frame_idx].cpu().numpy()
+            pose = pose_seq[frame_idx].matrix().cpu().numpy()
+            camera_type = camera_types[frame_idx]
+            fx, fy, cx, cy = intr[:4]
+            R, t = pose[:3, :3], pose[:3, 3]
+            
+            # --- Scene backprojection (현재 프레임) ---
+            mask = reliable_depth_mask_range(torch.from_numpy(depth)).numpy()
+            colors_scene = rgb if rgb.max() > 1 else (rgb * 255).astype(np.uint8)
+            
+            ys, xs = np.where(mask)
+            if len(xs) > 0:
+                z = depth[ys, xs]
+                X = (xs - cx) * z / fx
+                Y = (ys - cy) * z / fy
+                pts_cam = np.stack([X, Y, z], axis=-1)
+                pts_world_scene = (pts_cam @ R.T) + t
+                colors_scene_curr = colors_scene[ys, xs] if colors_scene.ndim == 3 else colors_scene
+            else:
+                pts_world_scene = np.empty((0, 3))
+                colors_scene_curr = np.empty((0, 3))
+            
+            # --- 현재 프레임의 추적된 픽셀들을 3D로 변환하여 모션 벡터 계산 ---
+            overlap_pixels = tracked_overlap.get(frame_idx)
+            nearby_pixels = tracked_nearby.get(frame_idx) if tracked_nearby else None
+            
+            if frame_idx == 0:
+                motion_vector = np.zeros(3)
+            else:
+                pts_3d_frame_i = []
+                if overlap_pixels is not None and len(overlap_pixels) > 0:
+                    pts_3d_overlap_i = pixels_to_3d(overlap_pixels, depth, intr, pose)
+                    pts_3d_frame_i.append(pts_3d_overlap_i)
+                if nearby_pixels is not None and len(nearby_pixels) > 0:
+                    pts_3d_nearby_i = pixels_to_3d(nearby_pixels, depth, intr, pose)
+                    pts_3d_frame_i.append(pts_3d_nearby_i)
+                
+                if len(pts_3d_frame_i) == 0:
+                    # 추적 실패 시 object를 첫 프레임 위치에 유지
+                    motion_vector = np.zeros(3)
+                else:
+                    pts_3d_frame_i = np.vstack(pts_3d_frame_i)
+                    # 첫 프레임의 평균 위치와 현재 프레임의 평균 위치 차이로 모션 벡터 계산
+                    center_0 = pts_3d_frame_0.mean(axis=0)
+                    center_i = pts_3d_frame_i.mean(axis=0)
+                    motion_vector = center_i - center_0
+            
+            # Object를 모션 벡터만큼 이동
+            obj_points_moved = obj_points + motion_vector
+            
+            # --- scene + object merge ---
+            all_points = np.concatenate([pts_world_scene, obj_points_moved], axis=0)
+            all_colors = np.concatenate([colors_scene_curr, obj_colors], axis=0)
+            
+            # --- projection ---
+            canvas = project_points(
+                xyz=all_points,
+                intrinsics=intr,
+                camera_type=camera_type,
+                pose=pose_seq[frame_idx],
+                frame_size=(h, w),
+                subsample_factor=1,
+                color=all_colors,
+            )
+            
+            frames.append(canvas)
+            
+            if frame_idx % 10 == 0:
+                logger.info(f"  Processed frame {frame_idx}/{len(rgb_seq)-1}")
+        
+        # 비디오 저장
+        logger.info(f"💾 Saving video to {save_path}...")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i, frame in enumerate(frames):
+                Image.fromarray(frame).save(f"{tmpdir}/frame_{i:06d}.png")
+            
+            subprocess.run([
+                "ffmpeg", "-y", "-r", "30", "-i", f"{tmpdir}/frame_%06d.png",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", save_path
+            ], check=True, capture_output=True)
+        
+        logger.info(f"✅ Saved reprojected video to {save_path}")
+
     def _update_custom_object(self):
         """GUI 슬라이더 값으로 물체 transform"""
         if not hasattr(self, "pc_raw"):
@@ -1253,214 +1415,6 @@ class ClientClosures:
             ], check=True)
 
         logger.info(f"✅ Saved translation-only tracked video to {save_path}")
-
-    def reproject_single_frame(self, frame_idx: int):
-        """
-        특정 프레임만 reproject하여 이미지로 저장합니다.
-        첫 프레임 기준으로 포인트들을 추적하여 object를 이동시킵니다.
-        
-        Args:
-            frame_idx: reproject할 프레임 인덱스
-        """
-        from pathlib import Path
-        from PIL import Image
-        from vipe.utils.visualization import project_points
-        
-        logger.info(f"🎬 Reprojecting single frame {frame_idx}...")
-        
-        current_artifact = self.global_context().artifacts[self.gui_id.value]
-        rgb_seq = list(read_rgb_artifacts(current_artifact.rgb_path))
-        pose_seq = read_pose_artifacts(current_artifact.pose_path)[1]
-        intr_seq = read_intrinsics_artifacts(current_artifact.intrinsics_path, current_artifact.camera_type_path)[1]
-        depth_seq = list(read_depth_artifacts(current_artifact.depth_path))
-        
-        if frame_idx >= len(rgb_seq) or frame_idx >= len(depth_seq):
-            logger.warning(f"❌ Frame index {frame_idx} out of range")
-            return
-        
-        if not hasattr(self, "pc_world"):
-            logger.warning("❌ No object point cloud found.")
-            return
-        
-        h, w, _ = rgb_seq[0][1].shape
-        
-        obj_points = self.pc_world.copy()
-        obj_colors = np.tile(np.array([[0, 255, 0]]), (obj_points.shape[0], 1))
-        nearby_distance = self.gui_nearby_distance.value
-        
-        # --- 첫 프레임의 점들 저장 ---
-        frame_0_depth = depth_seq[0][1].cpu().numpy()
-        frame_0_intr = intr_seq[0].cpu().numpy()
-        frame_0_pose = pose_seq[0].matrix().cpu().numpy()
-        frame_0_mask = reliable_depth_mask_range(torch.from_numpy(frame_0_depth)).numpy()
-        
-        ys_0, xs_0 = np.where(frame_0_mask)
-        if len(xs_0) == 0:
-            logger.warning("❌ No valid points in frame 0")
-            return
-        
-        fx_0, fy_0, cx_0, cy_0 = frame_0_intr[:4]
-        R_0, t_0 = frame_0_pose[:3, :3], frame_0_pose[:3, 3]
-        z_0 = frame_0_depth[ys_0, xs_0]
-        X_0 = (xs_0 - cx_0) * z_0 / fx_0
-        Y_0 = (ys_0 - cy_0) * z_0 / fy_0
-        pts_cam_0 = np.stack([X_0, Y_0, z_0], axis=-1)
-        pts_world_frame_0 = (pts_cam_0 @ R_0.T) + t_0  # 첫 프레임의 world 좌표
-        
-        # 첫 프레임의 pixel 좌표 저장 (추적용)
-        pixel_coords_frame_0 = np.stack([xs_0, ys_0], axis=1).astype(float)  # [N, 2]
-        
-        # 현재 프레임 데이터
-        rgb = rgb_seq[frame_idx][1].cpu().numpy()
-        depth = depth_seq[frame_idx][1].cpu().numpy()
-        intr = intr_seq[frame_idx].cpu().numpy()
-        pose = pose_seq[frame_idx].matrix().cpu().numpy()
-        fx, fy, cx, cy = intr[:4]
-        R, t = pose[:3, :3], pose[:3, 3]
-        
-        # Scene backprojection
-        mask = reliable_depth_mask_range(torch.from_numpy(depth)).numpy()
-        colors_scene = rgb if rgb.max() > 1 else (rgb * 255).astype(np.uint8)
-        
-        ys, xs = np.where(mask)
-        if len(xs) > 0:
-            z = depth[ys, xs]
-            X = (xs - cx) * z / fx
-            Y = (ys - cy) * z / fy
-            pts_cam = np.stack([X, Y, z], axis=-1)
-            pts_world_scene = (pts_cam @ R.T) + t
-            colors_scene_curr = colors_scene[ys, xs] if colors_scene.ndim == 3 else colors_scene
-        else:
-            pts_world_scene = np.empty((0, 3))
-            colors_scene_curr = np.empty((0, 3))
-        
-        # --- 첫 프레임의 점들을 현재 프레임까지 추적 ---
-        if frame_idx == 0:
-            # 첫 프레임이면 그대로 사용
-            current_pixel_coords = pixel_coords_frame_0.copy()
-            valid_tracking = np.ones(len(current_pixel_coords), dtype=bool)
-        else:
-            # Optical flow를 연속적으로 따라가서 첫 프레임의 점들이 현재 프레임의 어디에 있는지 추적
-            current_pixel_coords = pixel_coords_frame_0.copy()
-            valid_tracking = np.ones(len(current_pixel_coords), dtype=bool)
-            
-            for flow_frame_idx in range(frame_idx):
-                if flow_frame_idx >= len(self.flow_cache) or self.flow_cache[flow_frame_idx] is None:
-                    # flow가 없으면 해당 점들을 invalid로 표시
-                    valid_tracking[:] = False
-                    break
-                
-                flow_np = self.flow_cache[flow_frame_idx].numpy()
-                
-                # 현재 pixel 좌표가 유효한 범위 내에 있는지 확인
-                valid_bounds = (
-                    (current_pixel_coords[:, 0] >= 0) & (current_pixel_coords[:, 0] < w) &
-                    (current_pixel_coords[:, 1] >= 0) & (current_pixel_coords[:, 1] < h)
-                )
-                valid_tracking &= valid_bounds
-                
-                if not valid_tracking.any():
-                    break
-                
-                # Optical flow로 다음 프레임의 pixel 좌표 계산
-                valid_coords = current_pixel_coords[valid_tracking].astype(int)
-                u_flow = flow_np[0, valid_coords[:, 1], valid_coords[:, 0]]
-                v_flow = flow_np[1, valid_coords[:, 1], valid_coords[:, 0]]
-                
-                # 다음 프레임의 pixel 좌표
-                current_pixel_coords[valid_tracking, 0] += u_flow
-                current_pixel_coords[valid_tracking, 1] += v_flow
-            
-            # 최종 유효 범위 체크
-            valid_bounds = (
-                (current_pixel_coords[:, 0] >= 0) & (current_pixel_coords[:, 0] < w) &
-                (current_pixel_coords[:, 1] >= 0) & (current_pixel_coords[:, 1] < h)
-            )
-            valid_tracking &= valid_bounds
-        
-        # --- 유효한 추적만 사용하여 현재 프레임의 3D 점 계산 ---
-        if valid_tracking.sum() == 0:
-            logger.warning(f"  frame {frame_idx}: No valid tracked points")
-            # Object는 첫 프레임 위치 유지
-            tracked_points = obj_points.copy()
-        else:
-            # 유효한 추적된 pixel 좌표
-            valid_coords = current_pixel_coords[valid_tracking].astype(int)
-            
-            # 현재 프레임에서의 depth 가져오기
-            z_curr = depth[valid_coords[:, 1], valid_coords[:, 0]]
-            depth_mask_curr = reliable_depth_mask_range(torch.from_numpy(depth)).numpy()
-            valid_depth_curr = depth_mask_curr[valid_coords[:, 1], valid_coords[:, 0]] & (z_curr > 0)
-            
-            if valid_depth_curr.sum() == 0:
-                logger.warning(f"  frame {frame_idx}: No valid depth for tracked points")
-                tracked_points = obj_points.copy()
-            else:
-                # 유효한 depth만 사용
-                valid_final = valid_tracking.copy()
-                valid_final[valid_tracking] = valid_depth_curr
-                
-                z_curr_valid = z_curr[valid_depth_curr]
-                valid_coords_final = valid_coords[valid_depth_curr]
-                
-                # 현재 프레임의 3D 점들 (world 좌표)
-                X_curr = (valid_coords_final[:, 0] - cx) * z_curr_valid / fx
-                Y_curr = (valid_coords_final[:, 1] - cy) * z_curr_valid / fy
-                pts_cam_curr = np.stack([X_curr, Y_curr, z_curr_valid], axis=-1)
-                pts_world_curr = (pts_cam_curr @ R.T) + t
-                
-                # 첫 프레임 기준의 motion vector 계산
-                pts_world_frame_0_valid = pts_world_frame_0[valid_final]
-                motion_vectors = pts_world_curr - pts_world_frame_0_valid  # [N, 3]
-                
-                # Object 중심점 계산
-                obj_center_ref = obj_points.mean(axis=0)
-                
-                # Object 근처의 점들 찾기 (첫 프레임 기준 거리)
-                distances_to_obj = np.linalg.norm(pts_world_frame_0_valid - obj_center_ref, axis=1)
-                nearby_mask = distances_to_obj <= nearby_distance
-                
-                if nearby_mask.sum() > 0:
-                    # 근처 점들의 motion vector 평균 계산
-                    nearby_motion_vectors = motion_vectors[nearby_mask]
-                    avg_motion = np.mean(nearby_motion_vectors, axis=0)
-                    
-                    # Object를 첫 프레임 위치에서 평균 motion만큼 이동
-                    tracked_points = obj_points + avg_motion
-                    
-                    logger.info(
-                        f"  frame {frame_idx}: "
-                        f"tracked {valid_final.sum()}/{len(valid_tracking)} points, "
-                        f"found {nearby_mask.sum()} nearby points, "
-                        f"avg motion from frame 0 = [{avg_motion[0]:.3f}, {avg_motion[1]:.3f}, {avg_motion[2]:.3f}]"
-                    )
-                else:
-                    logger.warning(f"  frame {frame_idx}: No nearby points found (distance={nearby_distance:.2f})")
-                    # Object는 첫 프레임 위치 유지
-                    tracked_points = obj_points.copy()
-        
-        # Scene + object merge
-        all_points = np.concatenate([pts_world_scene, tracked_points], axis=0)
-        all_colors = np.concatenate([colors_scene_curr, obj_colors], axis=0)
-        
-        # Projection
-        img = project_points(
-            xyz=all_points,
-            intrinsics=intr,
-            camera_type=CameraType.PINHOLE,
-            pose=pose_seq[frame_idx],
-            frame_size=(h, w),
-            subsample_factor=1,
-            color=all_colors,
-        )
-        
-        # 별도 폴더에 저장
-        save_dir = Path("single_frame_reprojections")
-        save_dir.mkdir(exist_ok=True)
-        save_path = save_dir / f"frame_{frame_idx:04d}_reproject.png"
-        Image.fromarray(img).save(save_path)
-        
-        logger.info(f"✅ Saved reprojected frame to {save_path}")
 
     def match_3d_points_with_optical_flow(self, frame_idx_i: int, frame_idx_j: int):
         """
@@ -1894,7 +1848,7 @@ def main():
         "-p",
         "--port",
         type=int,
-        default=20530,
+        default=12345,
         help="Port number for the viser server.",
     )
     parser.add_argument(

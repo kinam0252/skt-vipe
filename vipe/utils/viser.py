@@ -343,6 +343,11 @@ class ClientClosures:
                 "Frame to Reproject", min=0, max=max_frames, step=1, initial_value=0
             )
             
+            self.gui_inertia_start_frame = self.client.gui.add_slider(
+                "Inertia Start Frame", min=-1, max=max_frames, step=1, initial_value=-1,
+                hint="관성 적용 시작 프레임 (-1 = 비활성화). 이 프레임부터는 관성 모션이 적용됩니다."
+            )
+            
             gui_reproject_single = self.client.gui.add_button(
                 "Reproject Single Frame",
                 hint="선택한 프레임만 reproject하여 이미지로 저장합니다",
@@ -1378,66 +1383,185 @@ class ClientClosures:
             )
             valid_tracking &= valid_bounds
         
+        # --- 관성 시작 프레임 확인 ---
+        inertia_start_frame = getattr(self, "gui_inertia_start_frame", None)
+        if inertia_start_frame is not None:
+            inertia_start_frame_value = int(inertia_start_frame.value)
+        else:
+            inertia_start_frame_value = -1  # 비활성화
+        
+        use_inertia = (inertia_start_frame_value >= 0 and frame_idx >= inertia_start_frame_value)
+        
         # --- 유효한 추적만 사용하여 현재 프레임의 3D 점 계산 ---
         if valid_tracking.sum() == 0:
             logger.warning(f"  frame {frame_idx}: No valid tracked points")
             # Object는 첫 프레임 위치 유지
             tracked_points = obj_points.copy()
         else:
-            # 유효한 추적된 pixel 좌표
-            valid_coords = current_pixel_coords[valid_tracking].astype(int)
-            
-            # 현재 프레임에서의 depth 가져오기
-            z_curr = depth[valid_coords[:, 1], valid_coords[:, 0]]
-            depth_mask_curr = reliable_depth_mask_range(torch.from_numpy(depth)).numpy()
-            valid_depth_curr = depth_mask_curr[valid_coords[:, 1], valid_coords[:, 0]] & (z_curr > 0)
-            
-            if valid_depth_curr.sum() == 0:
-                logger.warning(f"  frame {frame_idx}: No valid depth for tracked points")
-                tracked_points = obj_points.copy()
-            else:
-                # 유효한 depth만 사용
-                valid_final = valid_tracking.copy()
-                valid_final[valid_tracking] = valid_depth_curr
+            if use_inertia:
+                # 관성 적용: inertia_start_frame에서의 모션 벡터를 선형 확장
+                logger.info(f"  frame {frame_idx}: Using inertia from frame {inertia_start_frame_value}")
                 
-                z_curr_valid = z_curr[valid_depth_curr]
-                valid_coords_final = valid_coords[valid_depth_curr]
+                # Inertia 시작 프레임의 데이터 가져오기
+                inertia_depth = depth_seq[inertia_start_frame_value][1].cpu().numpy()
+                inertia_intr = intr_seq[inertia_start_frame_value].cpu().numpy()
+                inertia_pose = pose_seq[inertia_start_frame_value].matrix().cpu().numpy()
+                inertia_fx, inertia_fy, inertia_cx, inertia_cy = inertia_intr[:4]
+                inertia_R, inertia_t = inertia_pose[:3, :3], inertia_pose[:3, 3]
                 
-                # 현재 프레임의 3D 점들 (world 좌표)
-                X_curr = (valid_coords_final[:, 0] - cx) * z_curr_valid / fx
-                Y_curr = (valid_coords_final[:, 1] - cy) * z_curr_valid / fy
-                pts_cam_curr = np.stack([X_curr, Y_curr, z_curr_valid], axis=-1)
-                pts_world_curr = (pts_cam_curr @ R.T) + t
+                # Inertia 시작 프레임까지의 pixel 좌표 추적
+                inertia_pixel_coords = pixel_coords_frame_0.copy()
+                inertia_valid_tracking = np.ones(len(inertia_pixel_coords), dtype=bool)
                 
-                # 첫 프레임 기준의 motion vector 계산
-                pts_world_frame_0_valid = pts_world_frame_0[valid_final]
-                motion_vectors = pts_world_curr - pts_world_frame_0_valid  # [N, 3]
-                
-                # Object 중심점 계산
-                obj_center_ref = obj_points.mean(axis=0)
-                
-                # Object 근처의 점들 찾기 (첫 프레임 기준 거리)
-                distances_to_obj = np.linalg.norm(pts_world_frame_0_valid - obj_center_ref, axis=1)
-                nearby_mask = distances_to_obj <= nearby_distance
-                
-                if nearby_mask.sum() > 0:
-                    # 근처 점들의 motion vector 평균 계산
-                    nearby_motion_vectors = motion_vectors[nearby_mask]
-                    avg_motion = np.mean(nearby_motion_vectors, axis=0)
+                for flow_frame_idx in range(inertia_start_frame_value):
+                    if flow_frame_idx >= len(self.flow_cache) or self.flow_cache[flow_frame_idx] is None:
+                        inertia_valid_tracking[:] = False
+                        break
                     
-                    # Object를 첫 프레임 위치에서 평균 motion만큼 이동
-                    tracked_points = obj_points + avg_motion
-                    
-                    logger.info(
-                        f"  frame {frame_idx}: "
-                        f"tracked {valid_final.sum()}/{len(valid_tracking)} points, "
-                        f"found {nearby_mask.sum()} nearby points, "
-                        f"avg motion from frame 0 = [{avg_motion[0]:.3f}, {avg_motion[1]:.3f}, {avg_motion[2]:.3f}]"
+                    flow_np = self.flow_cache[flow_frame_idx].numpy()
+                    valid_bounds = (
+                        (inertia_pixel_coords[:, 0] >= 0) & (inertia_pixel_coords[:, 0] < w) &
+                        (inertia_pixel_coords[:, 1] >= 0) & (inertia_pixel_coords[:, 1] < h)
                     )
-                else:
-                    logger.warning(f"  frame {frame_idx}: No nearby points found (distance={nearby_distance:.2f})")
-                    # Object는 첫 프레임 위치 유지
+                    inertia_valid_tracking &= valid_bounds
+                    
+                    if not inertia_valid_tracking.any():
+                        break
+                    
+                    valid_coords = inertia_pixel_coords[inertia_valid_tracking].astype(int)
+                    u_flow = flow_np[0, valid_coords[:, 1], valid_coords[:, 0]]
+                    v_flow = flow_np[1, valid_coords[:, 1], valid_coords[:, 0]]
+                    
+                    inertia_pixel_coords[inertia_valid_tracking, 0] += u_flow
+                    inertia_pixel_coords[inertia_valid_tracking, 1] += v_flow
+                
+                # 최종 유효 범위 체크
+                valid_bounds = (
+                    (inertia_pixel_coords[:, 0] >= 0) & (inertia_pixel_coords[:, 0] < w) &
+                    (inertia_pixel_coords[:, 1] >= 0) & (inertia_pixel_coords[:, 1] < h)
+                )
+                inertia_valid_tracking &= valid_bounds
+                
+                if inertia_valid_tracking.sum() == 0:
+                    logger.warning(f"  frame {frame_idx}: No valid tracked points at inertia start frame {inertia_start_frame_value}")
                     tracked_points = obj_points.copy()
+                else:
+                    # Inertia 시작 프레임의 3D 점 계산
+                    inertia_valid_coords = inertia_pixel_coords[inertia_valid_tracking].astype(int)
+                    inertia_z_curr = inertia_depth[inertia_valid_coords[:, 1], inertia_valid_coords[:, 0]]
+                    inertia_depth_mask = reliable_depth_mask_range(torch.from_numpy(inertia_depth)).numpy()
+                    inertia_valid_depth = inertia_depth_mask[inertia_valid_coords[:, 1], inertia_valid_coords[:, 0]] & (inertia_z_curr > 0)
+                    
+                    if inertia_valid_depth.sum() == 0:
+                        logger.warning(f"  frame {frame_idx}: No valid depth at inertia start frame {inertia_start_frame_value}")
+                        tracked_points = obj_points.copy()
+                    else:
+                        inertia_valid_final = inertia_valid_tracking.copy()
+                        inertia_valid_final[inertia_valid_tracking] = inertia_valid_depth
+                        
+                        inertia_z_valid = inertia_z_curr[inertia_valid_depth]
+                        inertia_valid_coords_final = inertia_valid_coords[inertia_valid_depth]
+                        
+                        # Inertia 시작 프레임의 3D 점들 (world 좌표)
+                        inertia_X_curr = (inertia_valid_coords_final[:, 0] - inertia_cx) * inertia_z_valid / inertia_fx
+                        inertia_Y_curr = (inertia_valid_coords_final[:, 1] - inertia_cy) * inertia_z_valid / inertia_fy
+                        inertia_pts_cam_curr = np.stack([inertia_X_curr, inertia_Y_curr, inertia_z_valid], axis=-1)
+                        inertia_pts_world_curr = (inertia_pts_cam_curr @ inertia_R.T) + inertia_t
+                        
+                        # 첫 프레임 기준의 motion vector 계산 (inertia 시작 프레임에서)
+                        inertia_pts_world_frame_0_valid = pts_world_frame_0[inertia_valid_final]
+                        inertia_motion_vectors = inertia_pts_world_curr - inertia_pts_world_frame_0_valid  # [N, 3]
+                        
+                        # Object 중심점 계산
+                        obj_center_ref = obj_points.mean(axis=0)
+                        
+                        # Object 근처의 점들 찾기 (첫 프레임 기준 거리)
+                        inertia_distances_to_obj = np.linalg.norm(inertia_pts_world_frame_0_valid - obj_center_ref, axis=1)
+                        inertia_nearby_mask = inertia_distances_to_obj <= nearby_distance
+                        
+                        if inertia_nearby_mask.sum() > 0:
+                            # 근처 점들의 motion vector 평균 계산 (inertia 시작 프레임에서)
+                            inertia_nearby_motion_vectors = inertia_motion_vectors[inertia_nearby_mask]
+                            inertia_avg_motion = np.mean(inertia_nearby_motion_vectors, axis=0)
+                            
+                            # 선형 확장: (frame_idx / inertia_start_frame_value) 배만큼 확장
+                            if inertia_start_frame_value > 0:
+                                scale_factor = frame_idx / inertia_start_frame_value
+                            else:
+                                scale_factor = 1.0
+                            
+                            extended_motion = inertia_avg_motion * scale_factor
+                            
+                            # Object를 첫 프레임 위치에서 확장된 motion만큼 이동
+                            tracked_points = obj_points + extended_motion
+                            
+                            logger.info(
+                                f"  frame {frame_idx}: INERTIA MODE "
+                                f"(base frame {inertia_start_frame_value}, scale={scale_factor:.2f}) "
+                                f"tracked {inertia_valid_final.sum()}/{len(inertia_valid_tracking)} points, "
+                                f"found {inertia_nearby_mask.sum()} nearby points, "
+                                f"base motion = [{inertia_avg_motion[0]:.3f}, {inertia_avg_motion[1]:.3f}, {inertia_avg_motion[2]:.3f}], "
+                                f"extended motion = [{extended_motion[0]:.3f}, {extended_motion[1]:.3f}, {extended_motion[2]:.3f}]"
+                            )
+                        else:
+                            logger.warning(f"  frame {frame_idx}: No nearby points at inertia start frame {inertia_start_frame_value}")
+                            tracked_points = obj_points.copy()
+            else:
+                # 기존 로직: 현재 프레임에서 모션 벡터 계산
+                # 유효한 추적된 pixel 좌표
+                valid_coords = current_pixel_coords[valid_tracking].astype(int)
+                
+                # 현재 프레임에서의 depth 가져오기
+                z_curr = depth[valid_coords[:, 1], valid_coords[:, 0]]
+                depth_mask_curr = reliable_depth_mask_range(torch.from_numpy(depth)).numpy()
+                valid_depth_curr = depth_mask_curr[valid_coords[:, 1], valid_coords[:, 0]] & (z_curr > 0)
+                
+                if valid_depth_curr.sum() == 0:
+                    logger.warning(f"  frame {frame_idx}: No valid depth for tracked points")
+                    tracked_points = obj_points.copy()
+                else:
+                    # 유효한 depth만 사용
+                    valid_final = valid_tracking.copy()
+                    valid_final[valid_tracking] = valid_depth_curr
+                    
+                    z_curr_valid = z_curr[valid_depth_curr]
+                    valid_coords_final = valid_coords[valid_depth_curr]
+                    
+                    # 현재 프레임의 3D 점들 (world 좌표)
+                    X_curr = (valid_coords_final[:, 0] - cx) * z_curr_valid / fx
+                    Y_curr = (valid_coords_final[:, 1] - cy) * z_curr_valid / fy
+                    pts_cam_curr = np.stack([X_curr, Y_curr, z_curr_valid], axis=-1)
+                    pts_world_curr = (pts_cam_curr @ R.T) + t
+                    
+                    # 첫 프레임 기준의 motion vector 계산
+                    pts_world_frame_0_valid = pts_world_frame_0[valid_final]
+                    motion_vectors = pts_world_curr - pts_world_frame_0_valid  # [N, 3]
+                    
+                    # Object 중심점 계산
+                    obj_center_ref = obj_points.mean(axis=0)
+                    
+                    # Object 근처의 점들 찾기 (첫 프레임 기준 거리)
+                    distances_to_obj = np.linalg.norm(pts_world_frame_0_valid - obj_center_ref, axis=1)
+                    nearby_mask = distances_to_obj <= nearby_distance
+                    
+                    if nearby_mask.sum() > 0:
+                        # 근처 점들의 motion vector 평균 계산
+                        nearby_motion_vectors = motion_vectors[nearby_mask]
+                        avg_motion = np.mean(nearby_motion_vectors, axis=0)
+                        
+                        # Object를 첫 프레임 위치에서 평균 motion만큼 이동
+                        tracked_points = obj_points + avg_motion
+                        
+                        logger.info(
+                            f"  frame {frame_idx}: "
+                            f"tracked {valid_final.sum()}/{len(valid_tracking)} points, "
+                            f"found {nearby_mask.sum()} nearby points, "
+                            f"avg motion from frame 0 = [{avg_motion[0]:.3f}, {avg_motion[1]:.3f}, {avg_motion[2]:.3f}]"
+                        )
+                    else:
+                        logger.warning(f"  frame {frame_idx}: No nearby points found (distance={nearby_distance:.2f})")
+                        # Object는 첫 프레임 위치 유지
+                        tracked_points = obj_points.copy()
         
         # Scene + object merge
         all_points = np.concatenate([pts_world_scene, tracked_points], axis=0)
@@ -1865,7 +1989,7 @@ def run_viser(base_path: Path, port: int = 20540, obj: str = None):
     global _global_context
     _global_context = GlobalContext(artifacts=sorted(artifacts, key=lambda x: x.artifact_name))
 
-    server = viser.ViserServer(host="0.0.0.0", port=10001, verbose=False)
+    server = viser.ViserServer(host="0.0.0.0", port=port, verbose=False)
     client_closures: dict[int, ClientClosures] = {}
 
     @server.on_client_connect
